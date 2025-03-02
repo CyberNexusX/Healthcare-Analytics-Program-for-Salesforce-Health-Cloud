@@ -1,0 +1,619 @@
+"""
+Healthcare Analytics Program for Salesforce Health Cloud
+This program integrates with Salesforce Health Cloud to analyze patient behavior
+and identify high-risk patients who may need intervention.
+"""
+
+import pandas as pd
+import numpy as np
+from simple_salesforce import Salesforce
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import joblib
+import datetime
+import logging
+import os
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("healthcare_analytics.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class HealthcareAnalytics:
+    def __init__(self, sf_username, sf_password, sf_security_token, sf_domain='login'):
+        """
+        Initialize the Healthcare Analytics class with Salesforce credentials.
+        
+        Args:
+            sf_username (str): Salesforce username
+            sf_password (str): Salesforce password
+            sf_security_token (str): Salesforce security token
+            sf_domain (str): Salesforce domain, default is 'login'
+        """
+        self.sf = None
+        self.sf_username = sf_username
+        self.sf_password = sf_password
+        self.sf_security_token = sf_security_token
+        self.sf_domain = sf_domain
+        self.model = None
+        self.scaler = None
+        
+    def connect_to_salesforce(self):
+        """Connect to Salesforce using the provided credentials."""
+        try:
+            self.sf = Salesforce(
+                username=self.sf_username,
+                password=self.sf_password,
+                security_token=self.sf_security_token,
+                domain=self.sf_domain
+            )
+            logger.info("Successfully connected to Salesforce")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to Salesforce: {e}")
+            return False
+    
+    def fetch_patient_data(self, query_limit=1000):
+        """
+        Fetch patient data from Salesforce Health Cloud.
+        
+        Args:
+            query_limit (int): Maximum number of records to fetch
+            
+        Returns:
+            pandas.DataFrame: DataFrame containing patient data
+        """
+        if not self.sf:
+            if not self.connect_to_salesforce():
+                return None
+        
+        try:
+            # Query patient data from HealthCloudGA__EhrPatient__c object
+            # Adjust the query based on your Salesforce Health Cloud setup
+            query = f"""
+                SELECT Id, Name, HealthCloudGA__Age__c, HealthCloudGA__Gender__c, 
+                       HealthCloudGA__PrimaryLanguage__c, HealthCloudGA__MedicaidEnrollmentStatus__c,
+                       HealthCloudGA__MedicareEnrollmentStatus__c, 
+                       (SELECT Id, Name, ActivityDate, Status, Priority FROM Tasks),
+                       (SELECT HealthCloudGA__RelatedAccount__c, HealthCloudGA__DiagnosisDate__c, 
+                             HealthCloudGA__DiagnosticSummary__c FROM HealthCloudGA__EhrConditions__r),
+                       (SELECT HealthCloudGA__RelatedAccount__c, HealthCloudGA__MedicationName__c, 
+                             HealthCloudGA__Status__c FROM HealthCloudGA__EhrMedications__r),
+                       (SELECT HealthCloudGA__RelatedAccount__c, HealthCloudGA__ServiceDate__c,
+                             HealthCloudGA__Status__c FROM HealthCloudGA__EhrEncounters__r LIMIT 10)
+                FROM HealthCloudGA__EhrPatient__c
+                LIMIT {query_limit}
+            """
+            
+            patients = self.sf.query_all(query)
+            logger.info(f"Retrieved {len(patients['records'])} patient records")
+            
+            # Convert to DataFrame
+            patient_records = []
+            for record in patients['records']:
+                patient_data = {
+                    'PatientId': record['Id'],
+                    'Name': record['Name'],
+                    'Age': record.get('HealthCloudGA__Age__c', 0),
+                    'Gender': record.get('HealthCloudGA__Gender__c', ''),
+                    'PrimaryLanguage': record.get('HealthCloudGA__PrimaryLanguage__c', ''),
+                    'MedicaidStatus': record.get('HealthCloudGA__MedicaidEnrollmentStatus__c', ''),
+                    'MedicareStatus': record.get('HealthCloudGA__MedicareEnrollmentStatus__c', ''),
+                }
+                
+                # Process tasks
+                tasks = record.get('Tasks', {}).get('records', [])
+                patient_data['TaskCount'] = len(tasks)
+                patient_data['OpenTaskCount'] = sum(1 for t in tasks if t['Status'] == 'Open')
+                patient_data['HighPriorityTaskCount'] = sum(1 for t in tasks if t['Priority'] == 'High')
+                
+                # Process conditions
+                conditions = record.get('HealthCloudGA__EhrConditions__r', {}).get('records', [])
+                patient_data['ConditionCount'] = len(conditions)
+                patient_data['ChronicConditionCount'] = sum(1 for c in conditions if 'chronic' in (c.get('HealthCloudGA__DiagnosticSummary__c', '') or '').lower())
+                
+                # Process medications
+                medications = record.get('HealthCloudGA__EhrMedications__r', {}).get('records', [])
+                patient_data['MedicationCount'] = len(medications)
+                patient_data['ActiveMedicationCount'] = sum(1 for m in medications if m.get('HealthCloudGA__Status__c') == 'Active')
+                
+                # Process encounters
+                encounters = record.get('HealthCloudGA__EhrEncounters__r', {}).get('records', [])
+                patient_data['EncounterCount'] = len(encounters)
+                
+                # Calculate days since last encounter
+                if encounters:
+                    encounter_dates = [datetime.datetime.strptime(e['HealthCloudGA__ServiceDate__c'], '%Y-%m-%d')
+                                      for e in encounters if e.get('HealthCloudGA__ServiceDate__c')]
+                    if encounter_dates:
+                        latest_encounter = max(encounter_dates)
+                        days_since = (datetime.datetime.now() - latest_encounter).days
+                        patient_data['DaysSinceLastEncounter'] = days_since
+                    else:
+                        patient_data['DaysSinceLastEncounter'] = 365  # Default if no date
+                else:
+                    patient_data['DaysSinceLastEncounter'] = 365  # Default if no encounters
+                
+                patient_records.append(patient_data)
+            
+            return pd.DataFrame(patient_records)
+        
+        except Exception as e:
+            logger.error(f"Error fetching patient data: {e}")
+            return None
+    
+    def preprocess_data(self, df):
+        """
+        Preprocess patient data for analysis.
+        
+        Args:
+            df (pandas.DataFrame): DataFrame containing patient data
+            
+        Returns:
+            pandas.DataFrame: Preprocessed DataFrame
+        """
+        if df is None or df.empty:
+            logger.error("No data to preprocess")
+            return None
+        
+        try:
+            # Fill missing values
+            numeric_cols = ['Age', 'TaskCount', 'OpenTaskCount', 'HighPriorityTaskCount',
+                           'ConditionCount', 'ChronicConditionCount', 'MedicationCount',
+                           'ActiveMedicationCount', 'EncounterCount', 'DaysSinceLastEncounter']
+            
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = df[col].fillna(0)
+            
+            # Categorical encoding
+            categorical_cols = ['Gender', 'PrimaryLanguage', 'MedicaidStatus', 'MedicareStatus']
+            for col in categorical_cols:
+                if col in df.columns:
+                    df[col] = df[col].fillna('Unknown')
+                    df[col + '_Encoded'] = pd.factorize(df[col])[0]
+            
+            # Feature engineering
+            # Medication adherence proxy (ratio of active to total medications)
+            if 'MedicationCount' in df.columns and 'ActiveMedicationCount' in df.columns:
+                df['MedicationAdherence'] = df.apply(
+                    lambda x: x['ActiveMedicationCount'] / x['MedicationCount'] if x['MedicationCount'] > 0 else 0, 
+                    axis=1
+                )
+            
+            # Engagement score based on tasks and encounters
+            if all(col in df.columns for col in ['TaskCount', 'OpenTaskCount', 'EncounterCount']):
+                df['EngagementScore'] = (df['TaskCount'] - df['OpenTaskCount']) + df['EncounterCount']
+            
+            # Risk factor based on chronic conditions and age
+            if all(col in df.columns for col in ['ChronicConditionCount', 'Age']):
+                df['ChronicConditionAgeRisk'] = df['ChronicConditionCount'] * (df['Age'] / 100)
+            
+            # Identify missing follow-ups
+            if 'DaysSinceLastEncounter' in df.columns:
+                df['MissingFollowUp'] = df['DaysSinceLastEncounter'] > 180  # Flag if no visit in 6 months
+            
+            logger.info("Data preprocessing completed successfully")
+            return df
+        
+        except Exception as e:
+            logger.error(f"Error during data preprocessing: {e}")
+            return None
+    
+    def create_risk_model(self, df, target_column=None):
+        """
+        Create a model to predict patient risk.
+        If target_column is provided, use supervised learning, otherwise use unsupervised.
+        
+        Args:
+            df (pandas.DataFrame): Preprocessed patient data
+            target_column (str, optional): Name of the column to predict
+            
+        Returns:
+            bool: True if model creation was successful, False otherwise
+        """
+        if df is None or df.empty:
+            logger.error("No data to create model")
+            return False
+        
+        try:
+            # Feature selection
+            feature_cols = [col for col in df.columns if col.endswith('_Encoded') 
+                          or col in ['Age', 'TaskCount', 'ConditionCount', 'ChronicConditionCount',
+                                    'MedicationCount', 'ActiveMedicationCount', 'EncounterCount',
+                                    'DaysSinceLastEncounter', 'MedicationAdherence', 
+                                    'EngagementScore', 'ChronicConditionAgeRisk']]
+            
+            features = df[feature_cols].copy()
+            
+            # Handle any remaining missing values
+            features = features.fillna(0)
+            
+            # Scale features
+            self.scaler = StandardScaler()
+            features_scaled = self.scaler.fit_transform(features)
+            
+            # If we have labeled data, use supervised learning
+            if target_column and target_column in df.columns:
+                labels = df[target_column]
+                
+                # Split the data
+                X_train, X_test, y_train, y_test = train_test_split(
+                    features_scaled, labels, test_size=0.25, random_state=42
+                )
+                
+                # Train a RandomForest model
+                self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+                self.model.fit(X_train, y_train)
+                
+                # Evaluate the model
+                y_pred = self.model.predict(X_test)
+                logger.info(f"Classification Report:\n{classification_report(y_test, y_pred)}")
+                logger.info(f"Confusion Matrix:\n{confusion_matrix(y_test, y_pred)}")
+                
+            else:
+                # For unsupervised learning, we'll create a risk score based on selected features
+                # This is a simplified approach - in a real scenario, consider clustering or more sophisticated methods
+                logger.info("No target column provided. Creating risk score based on feature importance")
+                
+                # Create a basic RandomForest model to get feature importances
+                self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+                
+                # We'll create a synthetic target (high values = high risk) for feature importance
+                synthetic_target = features['ChronicConditionCount'] + features['Age'] / 10
+                synthetic_target = (synthetic_target > synthetic_target.median()).astype(int)
+                
+                # Fit the model
+                self.model.fit(features_scaled, synthetic_target)
+                
+                # Get feature importances
+                importances = self.model.feature_importances_
+                feature_importance = pd.DataFrame({
+                    'Feature': feature_cols,
+                    'Importance': importances
+                }).sort_values('Importance', ascending=False)
+                
+                logger.info(f"Feature importance:\n{feature_importance}")
+            
+            # Save the model
+            joblib.dump(self.model, 'healthcare_risk_model.pkl')
+            joblib.dump(self.scaler, 'healthcare_risk_scaler.pkl')
+            logger.info("Model created and saved successfully")
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error creating risk model: {e}")
+            return False
+    
+    def load_model(self, model_path='healthcare_risk_model.pkl', scaler_path='healthcare_risk_scaler.pkl'):
+        """
+        Load a previously saved model.
+        
+        Args:
+            model_path (str): Path to the saved model
+            scaler_path (str): Path to the saved scaler
+            
+        Returns:
+            bool: True if loading was successful, False otherwise
+        """
+        try:
+            if os.path.exists(model_path) and os.path.exists(scaler_path):
+                self.model = joblib.load(model_path)
+                self.scaler = joblib.load(scaler_path)
+                logger.info("Model and scaler loaded successfully")
+                return True
+            else:
+                logger.error("Model or scaler file not found")
+                return False
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            return False
+    
+    def predict_risk(self, df):
+        """
+        Predict risk scores for patients.
+        
+        Args:
+            df (pandas.DataFrame): Preprocessed patient data
+            
+        Returns:
+            pandas.DataFrame: DataFrame with original data and risk scores
+        """
+        if df is None or df.empty:
+            logger.error("No data to predict risk")
+            return None
+        
+        if self.model is None or self.scaler is None:
+            logger.error("Model or scaler not initialized")
+            return None
+        
+        try:
+            # Ensure we have all the necessary features
+            feature_cols = [col for col in df.columns if col.endswith('_Encoded') 
+                          or col in ['Age', 'TaskCount', 'ConditionCount', 'ChronicConditionCount',
+                                    'MedicationCount', 'ActiveMedicationCount', 'EncounterCount',
+                                    'DaysSinceLastEncounter', 'MedicationAdherence', 
+                                    'EngagementScore', 'ChronicConditionAgeRisk']]
+            
+            available_cols = [col for col in feature_cols if col in df.columns]
+            features = df[available_cols].copy()
+            
+            # Handle any missing values
+            features = features.fillna(0)
+            
+            # Scale features
+            features_scaled = self.scaler.transform(features)
+            
+            # Predict probabilities
+            risk_probs = self.model.predict_proba(features_scaled)[:, 1]
+            
+            # Add risk score to the original dataframe
+            result_df = df.copy()
+            result_df['RiskScore'] = risk_probs
+            
+            # Add risk category
+            result_df['RiskCategory'] = pd.cut(
+                result_df['RiskScore'],
+                bins=[0, 0.3, 0.6, 1.0],
+                labels=['Low', 'Medium', 'High']
+            )
+            
+            logger.info(f"Risk predictions completed for {len(df)} patients")
+            return result_df
+        
+        except Exception as e:
+            logger.error(f"Error predicting risk: {e}")
+            return None
+    
+    def upload_risk_scores_to_salesforce(self, risk_df):
+        """
+        Upload risk scores back to Salesforce Health Cloud.
+        
+        Args:
+            risk_df (pandas.DataFrame): DataFrame with risk scores
+            
+        Returns:
+            bool: True if upload was successful, False otherwise
+        """
+        if risk_df is None or risk_df.empty:
+            logger.error("No risk data to upload")
+            return False
+        
+        if not self.sf:
+            if not self.connect_to_salesforce():
+                return False
+        
+        try:
+            # Batch size for Salesforce API calls
+            batch_size = 200
+            success_count = 0
+            error_count = 0
+            
+            # Process in batches
+            for i in range(0, len(risk_df), batch_size):
+                batch = risk_df.iloc[i:i+batch_size]
+                
+                for _, row in batch.iterrows():
+                    patient_id = row['PatientId']
+                    risk_score = float(row['RiskScore'])
+                    risk_category = row['RiskCategory']
+                    
+                    # Create a custom field update
+                    # Assuming you have custom fields for risk score and category
+                    update_data = {
+                        'Risk_Score__c': risk_score,
+                        'Risk_Category__c': risk_category,
+                        'Last_Risk_Assessment_Date__c': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+                    }
+                    
+                    try:
+                        # Update the patient record
+                        self.sf.HealthCloudGA__EhrPatient__c.update(patient_id, update_data)
+                        success_count += 1
+                    except Exception as e:
+                        logger.error(f"Error updating patient {patient_id}: {e}")
+                        error_count += 1
+                
+                logger.info(f"Processed batch {i//batch_size + 1}, success: {success_count}, errors: {error_count}")
+            
+            # Create a Care Gap record for high-risk patients that need intervention
+            high_risk_patients = risk_df[risk_df['RiskCategory'] == 'High']
+            gap_count = 0
+            
+            for _, patient in high_risk_patients.iterrows():
+                patient_id = patient['PatientId']
+                
+                # Create a Care Gap record - adjust fields as needed for your org
+                care_gap_data = {
+                    'HealthCloudGA__Account__c': patient_id,
+                    'HealthCloudGA__GapStatus__c': 'Open',
+                    'HealthCloudGA__GapReason__c': 'High Risk Assessment',
+                    'HealthCloudGA__GapPriority__c': 'High',
+                    'HealthCloudGA__GapCreateDate__c': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+                }
+                
+                try:
+                    # Create the care gap record
+                    self.sf.HealthCloudGA__CareGap__c.create(care_gap_data)
+                    gap_count += 1
+                except Exception as e:
+                    logger.error(f"Error creating care gap for patient {patient_id}: {e}")
+            
+            logger.info(f"Created {gap_count} care gaps for high-risk patients")
+            logger.info(f"Upload completed: {success_count} successes, {error_count} errors")
+            
+            return success_count > 0
+        
+        except Exception as e:
+            logger.error(f"Error uploading risk scores: {e}")
+            return False
+    
+    def generate_intervention_recommendations(self, risk_df):
+        """
+        Generate intervention recommendations based on risk levels.
+        
+        Args:
+            risk_df (pandas.DataFrame): DataFrame with risk scores
+            
+        Returns:
+            pandas.DataFrame: DataFrame with recommendations
+        """
+        if risk_df is None or risk_df.empty:
+            logger.error("No risk data for recommendations")
+            return None
+        
+        try:
+            # Create a copy for recommendations
+            rec_df = risk_df.copy()
+            
+            # Define recommendation logic based on risk factors
+            def get_recommendation(row):
+                recommendations = []
+                
+                # Check for specific risk factors
+                if row['RiskCategory'] == 'High':
+                    recommendations.append("Immediate care coordination intervention required")
+                    
+                    if row.get('ChronicConditionCount', 0) > 2:
+                        recommendations.append("Chronic care management program enrollment")
+                    
+                    if row.get('MedicationCount', 0) > 5:
+                        recommendations.append("Medication reconciliation and therapy management")
+                    
+                    if row.get('MissingFollowUp', False):
+                        recommendations.append("Schedule immediate follow-up appointment")
+                    
+                elif row['RiskCategory'] == 'Medium':
+                    recommendations.append("Preventive care coordination recommended")
+                    
+                    if row.get('DaysSinceLastEncounter', 0) > 90:
+                        recommendations.append("Schedule follow-up within 30 days")
+                    
+                    if row.get('MedicationAdherence', 1) < 0.8:
+                        recommendations.append("Medication adherence counseling")
+                    
+                else:  # Low risk
+                    recommendations.append("Routine care maintenance")
+                    
+                    if row.get('DaysSinceLastEncounter', 0) > 180:
+                        recommendations.append("Schedule routine check-up")
+                
+                # Add age-specific recommendations
+                if row.get('Age', 0) > 65:
+                    recommendations.append("Fall risk assessment")
+                    recommendations.append("Medicare Annual Wellness Visit if not completed")
+                
+                return "; ".join(recommendations)
+            
+            # Apply the recommendation logic
+            rec_df['InterventionRecommendations'] = rec_df.apply(get_recommendation, axis=1)
+            
+            logger.info("Generated intervention recommendations")
+            return rec_df
+        
+        except Exception as e:
+            logger.error(f"Error generating recommendations: {e}")
+            return None
+    
+    def run_full_analysis(self):
+        """
+        Run the full analysis pipeline from data fetching to recommendations.
+        
+        Returns:
+            pandas.DataFrame: DataFrame with risk scores and recommendations
+        """
+        try:
+            # Step 1: Fetch patient data
+            logger.info("Starting full analysis pipeline")
+            patient_data = self.fetch_patient_data()
+            
+            if patient_data is None or patient_data.empty:
+                logger.error("Failed to fetch patient data")
+                return None
+            
+            # Step 2: Preprocess the data
+            processed_data = self.preprocess_data(patient_data)
+            
+            if processed_data is None:
+                logger.error("Failed to preprocess data")
+                return None
+            
+            # Step 3: Load or create risk model
+            if os.path.exists('healthcare_risk_model.pkl'):
+                logger.info("Loading existing risk model")
+                model_loaded = self.load_model()
+                if not model_loaded:
+                    logger.warning("Failed to load existing model, creating new one")
+                    model_created = self.create_risk_model(processed_data)
+                    if not model_created:
+                        logger.error("Failed to create risk model")
+                        return None
+            else:
+                logger.info("Creating new risk model")
+                model_created = self.create_risk_model(processed_data)
+                if not model_created:
+                    logger.error("Failed to create risk model")
+                    return None
+            
+            # Step 4: Predict risk scores
+            risk_results = self.predict_risk(processed_data)
+            
+            if risk_results is None:
+                logger.error("Failed to predict risk scores")
+                return None
+            
+            # Step 5: Generate intervention recommendations
+            recommendations = self.generate_intervention_recommendations(risk_results)
+            
+            if recommendations is None:
+                logger.error("Failed to generate recommendations")
+                return None
+            
+            # Step 6: Upload results to Salesforce
+            logger.info("Uploading results to Salesforce")
+            upload_success = self.upload_risk_scores_to_salesforce(recommendations)
+            
+            if upload_success:
+                logger.info("Successfully uploaded risk scores to Salesforce")
+            else:
+                logger.warning("Failed to upload some or all risk scores to Salesforce")
+            
+            # Return the final results
+            return recommendations
+        
+        except Exception as e:
+            logger.error(f"Error in full analysis pipeline: {e}")
+            return None
+
+
+# Example usage
+if __name__ == "__main__":
+    # Replace with your Salesforce credentials
+    healthcare_analytics = HealthcareAnalytics(
+        sf_username="your_username@example.com",
+        sf_password="your_password",
+        sf_security_token="your_security_token"
+    )
+    
+    # Run the full analysis
+    results = healthcare_analytics.run_full_analysis()
+    
+    if results is not None:
+        # Output summary of high-risk patients
+        high_risk = results[results['RiskCategory'] == 'High']
+        print(f"Found {len(high_risk)} high-risk patients requiring intervention")
+        
+        # Save results to CSV
+        results.to_csv("patient_risk_analysis.csv", index=False)
+        print("Results saved to patient_risk_analysis.csv")
+    else:
+        print("Analysis failed. Check the logs for details.")
